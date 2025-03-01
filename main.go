@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"sync"
+	"syscall"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -41,7 +47,7 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	
+
 	fmt.Println("Database initialized successfully")
 }
 
@@ -161,7 +167,7 @@ func updateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	
+
 	user.ID = id
 
 	// Update user in database
@@ -221,17 +227,147 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// RequestTracker keeps track of active requests
+type RequestTracker struct {
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	active  map[string]bool
+	timeout time.Duration
+}
+
+// NewRequestTracker creates a new request tracker
+func NewRequestTracker(timeout time.Duration) *RequestTracker {
+	return &RequestTracker{
+		active:  make(map[string]bool),
+		timeout: timeout,
+	}
+}
+
+// Add registers a new request with a unique ID
+func (rt *RequestTracker) Add(id string) {
+	rt.mu.Lock()
+	rt.active[id] = true
+	rt.mu.Unlock()
+	rt.wg.Add(1)
+}
+
+// Done marks a request as completed
+func (rt *RequestTracker) Done(id string) {
+	rt.mu.Lock()
+	delete(rt.active, id)
+	rt.mu.Unlock()
+	rt.wg.Done()
+}
+
+// Wait waits for all active requests to complete with timeout
+func (rt *RequestTracker) Wait() bool {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		rt.wg.Wait()
+	}()
+
+	select {
+	case <-c:
+		return true // All requests completed
+	case <-time.After(rt.timeout):
+		return false // Timed out
+	}
+}
+
+// ActiveRequests returns number of active requests
+func (rt *RequestTracker) ActiveRequests() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return len(rt.active)
+}
+
+// middleware for tracking requests
+func requestTrackerMiddleware(tracker *RequestTracker, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Generate a unique request ID (could use UUID in production)
+		requestID := fmt.Sprintf("%s-%d", r.URL.Path, time.Now().UnixNano())
+
+		// Register request in tracker
+		tracker.Add(requestID)
+		defer tracker.Done(requestID)
+
+		// Process the request in a goroutine
+		done := make(chan bool)
+
+		go func() {
+			next(w, r)
+			close(done)
+		}()
+
+		// Wait for completion or context cancellation
+		select {
+		case <-done:
+			// Request completed normally
+			return
+		case <-r.Context().Done():
+			// Request was cancelled by client or server shutdown
+			log.Printf("Request %s cancelled or server shutting down", requestID)
+			return
+		}
+	}
+}
+
 func main() {
+	// Initialize database
 	initDB()
 	defer db.Close()
 
-	// Register handlers
-	http.HandleFunc("/users", getUsers)
-	http.HandleFunc("/user", getUser)
-	http.HandleFunc("/user/create", createUser)
-	http.HandleFunc("/user/update", updateUser)
-	http.HandleFunc("/user/delete", deleteUser)
+	// Create request tracker with 30 second timeout for graceful shutdown
+	tracker := NewRequestTracker(30 * time.Second)
 
-	fmt.Println("Server starting on port 8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Create a custom server
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: nil, // Using default ServeMux
+	}
+
+	// Register handlers with middleware
+	http.HandleFunc("/users", requestTrackerMiddleware(tracker, getUsers))
+	http.HandleFunc("/user", requestTrackerMiddleware(tracker, getUser))
+	http.HandleFunc("/user/create", requestTrackerMiddleware(tracker, createUser))
+	http.HandleFunc("/user/update", requestTrackerMiddleware(tracker, updateUser))
+	http.HandleFunc("/user/delete", requestTrackerMiddleware(tracker, deleteUser))
+
+	// Start server in a goroutine
+	go func() {
+		fmt.Println("Server starting on port 8080...")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Set up channel to listen for interrupt signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Block until interrupt signal is received
+	<-stop
+
+	// Begin graceful shutdown
+	log.Println("Shutting down server...")
+
+	// Create a deadline context for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Notify server to stop accepting new connections
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
+	}
+
+	// Wait for active requests to complete
+	log.Printf("Waiting for %d active requests to complete...", tracker.ActiveRequests())
+	if completed := tracker.Wait(); completed {
+		log.Println("All requests completed successfully")
+	} else {
+		log.Println("Timeout waiting for requests to complete")
+	}
+
+	log.Println("Server gracefully stopped")
 }
