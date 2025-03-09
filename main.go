@@ -5,369 +5,587 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // User represents a user in our system
 type User struct {
 	ID       int    `json:"id"`
 	Username string `json:"username"`
-	Email    string `json:"email"`
-	Age      int    `json:"age"`
+	Password string `json:"-"` // Never expose password in JSON
 }
 
-var db *sql.DB
+// Session represents an active user session
+type Session struct {
+	Token     string    `json:"token"`
+	UserID    int       `json:"user_id"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
 
-func initDB() {
-	var err error
-	db, err = sql.Open("sqlite3", "./users.db")
-	if err != nil {
-		log.Fatal(err)
-	}
+// Server encapsulates the HTTP server and its dependencies
+type Server struct {
+	db      *sql.DB
+	mux     *http.ServeMux
+	tmpl    *template.Template
+	server  *http.Server
+	sessions map[string]Session
+}
 
-	// Create users table if it doesn't exist
-	createTableSQL := `
+// Initialize the database schema
+func initDB(db *sql.DB) error {
+	_, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		username TEXT NOT NULL UNIQUE,
-		email TEXT NOT NULL UNIQUE,
-		age INTEGER
-	);`
-
-	_, err = db.Exec(createTableSQL)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("Database initialized successfully")
+		username TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE TABLE IF NOT EXISTS sessions (
+		token TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		expires_at TIMESTAMP NOT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+	`)
+	return err
 }
 
-// Handler functions
-func createUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var user User
-	err := json.NewDecoder(r.Body).Decode(&user)
+// NewServer creates and initializes a new server instance
+func NewServer() (*Server, error) {
+	// Initialize SQLite database
+	db, err := sql.Open("sqlite3", "./auth.db")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-
-	// Insert user into database
-	stmt, err := db.Prepare("INSERT INTO users(username, email, age) VALUES(?, ?, ?)")
+	
+	if err := initDB(db); err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+	
+	// Parse HTML templates
+	tmpl, err := template.ParseGlob("templates/*.html")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// If templates don't exist, create an empty template
+		tmpl = template.New("empty")
 	}
-	defer stmt.Close()
-
-	result, err := stmt.Exec(user.Username, user.Email, user.Age)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	
+	// Initialize server
+	s := &Server{
+		db:       db,
+		mux:      http.NewServeMux(),
+		tmpl:     tmpl,
+		sessions: make(map[string]Session),
 	}
-
-	id, _ := result.LastInsertId()
-	user.ID = int(id)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(user)
+	
+	// Register routes
+	s.routes()
+	
+	// Create HTTP server
+	s.server = &http.Server{
+		Addr:         ":8080",
+		Handler:      s.mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	
+	// Load sessions from database
+	if err := s.loadSessions(); err != nil {
+		return nil, fmt.Errorf("failed to load sessions: %w", err)
+	}
+	
+	return s, nil
 }
 
-func getUsers(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	rows, err := db.Query("SELECT id, username, email, age FROM users")
+// loadSessions loads active sessions from the database into memory
+func (s *Server) loadSessions() error {
+	rows, err := s.db.Query("SELECT token, user_id, created_at, expires_at FROM sessions WHERE expires_at > datetime('now')")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 	defer rows.Close()
-
-	users := []User{}
+	
 	for rows.Next() {
-		var user User
-		err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.Age)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		var sess Session
+		var createdStr, expiresStr string
+		
+		if err := rows.Scan(&sess.Token, &sess.UserID, &createdStr, &expiresStr); err != nil {
+			return err
 		}
-		users = append(users, user)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(users)
-}
-
-func getUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "ID parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	var user User
-	err := db.QueryRow("SELECT id, username, email, age FROM users WHERE id = ?", id).
-		Scan(&user.ID, &user.Username, &user.Email, &user.Age)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			http.Error(w, "User not found", http.StatusNotFound)
-			return
+		
+		sess.CreatedAt, _ = time.Parse(time.RFC3339, createdStr)
+		sess.ExpiresAt, _ = time.Parse(time.RFC3339, expiresStr)
+		
+		// Only store non-expired sessions
+		if sess.ExpiresAt.After(time.Now()) {
+			s.sessions[sess.Token] = sess
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+	
+	return rows.Err()
 }
 
-func updateUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "PUT" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	idStr := r.URL.Query().Get("id")
-	if idStr == "" {
-		http.Error(w, "ID parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		http.Error(w, "Invalid ID format", http.StatusBadRequest)
-		return
-	}
-
-	var user User
-	err = json.NewDecoder(r.Body).Decode(&user)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	user.ID = id
-
-	// Update user in database
-	stmt, err := db.Prepare("UPDATE users SET username = ?, email = ?, age = ? WHERE id = ?")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(user.Username, user.Email, user.Age, user.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
-}
-
-func deleteUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "DELETE" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "ID parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	stmt, err := db.Prepare("DELETE FROM users WHERE id = ?")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer stmt.Close()
-
-	result, err := stmt.Exec(id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if rowsAffected == 0 {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// RequestTracker keeps track of active requests
-type RequestTracker struct {
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	active  map[string]bool
-	timeout time.Duration
-}
-
-// NewRequestTracker creates a new request tracker
-func NewRequestTracker(timeout time.Duration) *RequestTracker {
-	return &RequestTracker{
-		active:  make(map[string]bool),
-		timeout: timeout,
-	}
-}
-
-// Add registers a new request with a unique ID
-func (rt *RequestTracker) Add(id string) {
-	rt.mu.Lock()
-	rt.active[id] = true
-	rt.mu.Unlock()
-	rt.wg.Add(1)
-}
-
-// Done marks a request as completed
-func (rt *RequestTracker) Done(id string) {
-	rt.mu.Lock()
-	delete(rt.active, id)
-	rt.mu.Unlock()
-	rt.wg.Done()
-}
-
-// Wait waits for all active requests to complete with timeout
-func (rt *RequestTracker) Wait() bool {
-	c := make(chan struct{})
+// Start starts the HTTP server
+func (s *Server) Start() error {
+	// Start the server in a goroutine
 	go func() {
-		defer close(c)
-		rt.wg.Wait()
-	}()
-
-	select {
-	case <-c:
-		return true // All requests completed
-	case <-time.After(rt.timeout):
-		return false // Timed out
-	}
-}
-
-// ActiveRequests returns number of active requests
-func (rt *RequestTracker) ActiveRequests() int {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return len(rt.active)
-}
-
-// middleware for tracking requests
-func requestTrackerMiddleware(tracker *RequestTracker, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Generate a unique request ID (could use UUID in production)
-		requestID := fmt.Sprintf("%s-%d", r.URL.Path, time.Now().UnixNano())
-
-		// Register request in tracker
-		tracker.Add(requestID)
-		defer tracker.Done(requestID)
-
-		// Process the request in a goroutine
-		done := make(chan bool)
-
-		go func() {
-			next(w, r)
-			close(done)
-		}()
-
-		// Wait for completion or context cancellation
-		select {
-		case <-done:
-			// Request completed normally
-			return
-		case <-r.Context().Done():
-			// Request was cancelled by client or server shutdown
-			log.Printf("Request %s cancelled or server shutting down", requestID)
-			return
-		}
-	}
-}
-
-func main() {
-	// Initialize database
-	initDB()
-	defer db.Close()
-
-	// Create request tracker with 30 second timeout for graceful shutdown
-	tracker := NewRequestTracker(30 * time.Second)
-
-	// Create a custom server
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: nil, // Using default ServeMux
-	}
-
-	// Register handlers with middleware
-	http.HandleFunc("/users", requestTrackerMiddleware(tracker, getUsers))
-	http.HandleFunc("/user", requestTrackerMiddleware(tracker, getUser))
-	http.HandleFunc("/user/create", requestTrackerMiddleware(tracker, createUser))
-	http.HandleFunc("/user/update", requestTrackerMiddleware(tracker, updateUser))
-	http.HandleFunc("/user/delete", requestTrackerMiddleware(tracker, deleteUser))
-
-	// Start server in a goroutine
-	go func() {
-		fmt.Println("Server starting on port 8080...")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Printf("Server started on \033]8;;http://localhost:8080/\033\\http://localhost:8080/\033]8;;\033\\\n")
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
-
-	// Set up channel to listen for interrupt signals
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// Block until interrupt signal is received
-	<-stop
-
-	// Begin graceful shutdown
-	log.Println("Shutting down server...")
-
-	// Create a deadline context for shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	
+	// Create a channel to listen for interrupt signals
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	
+	// Block until we receive a termination signal
+	<-done
+	log.Println("Server is shutting down...")
+	
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// Notify server to stop accepting new connections
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
+	
+	// Attempt graceful shutdown
+	if err := s.server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("server forced to shutdown: %w", err)
 	}
+	
+	log.Println("Server exited gracefully")
+	return nil
+}
 
-	// Wait for active requests to complete
-	log.Printf("Waiting for %d active requests to complete...", tracker.ActiveRequests())
-	if completed := tracker.Wait(); completed {
-		log.Println("All requests completed successfully")
-	} else {
-		log.Println("Timeout waiting for requests to complete")
+// Close closes the database connection
+func (s *Server) Close() error {
+	return s.db.Close()
+}
+
+// routes registers all the HTTP routes
+func (s *Server) routes() {
+	// Static files
+	s.mux.HandleFunc("GET /", s.handleHome())
+	s.mux.HandleFunc("GET /login", s.handleLoginPage())
+	s.mux.HandleFunc("GET /register", s.handleRegisterPage())
+	
+	// API endpoints
+	s.mux.HandleFunc("POST /api/register", s.handleRegister())
+	s.mux.HandleFunc("POST /api/login", s.handleLogin())
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout())
+	
+	// Protected routes
+	s.mux.HandleFunc("GET /dashboard", s.authenticated(s.handleDashboard()))
+}
+
+// Middleware for authentication
+func (s *Server) authenticated(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get session token from cookie
+		cookie, err := r.Cookie("session")
+		if err != nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		
+		// Check if session exists and is valid
+		session, exists := s.sessions[cookie.Value]
+		if !exists || session.ExpiresAt.Before(time.Now()) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		
+		// Session is valid, proceed
+		next(w, r)
 	}
+}
 
-	log.Println("Server gracefully stopped")
+// Get user from session
+func (s *Server) getUserFromSession(r *http.Request) (*User, error) {
+	cookie, err := r.Cookie("session")
+	if err != nil {
+		return nil, err
+	}
+	
+	session, exists := s.sessions[cookie.Value]
+	if !exists || session.ExpiresAt.Before(time.Now()) {
+		return nil, fmt.Errorf("invalid session")
+	}
+	
+	var user User
+	err = s.db.QueryRow("SELECT id, username FROM users WHERE id = ?", session.UserID).Scan(&user.ID, &user.Username)
+	if err != nil {
+		return nil, err
+	}
+	
+	return &user, nil
+}
+
+// Handlers
+func (s *Server) handleHome() http.HandlerFunc {
+	// For simplicity, we'll use a string template instead of a file
+	homeHTML := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Auth Server</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        nav { margin-bottom: 20px; }
+        nav a { margin-right: 15px; }
+    </style>
+</head>
+<body>
+    <h1>Welcome to Auth Server</h1>
+    <nav>
+        <a href="/login">Login</a>
+        <a href="/register">Register</a>
+        <a href="/dashboard">Dashboard (Protected)</a>
+    </nav>
+    <p>This is a simple authentication server built with Go.</p>
+</body>
+</html>`
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, homeHTML)
+	}
+}
+
+func (s *Server) handleLoginPage() http.HandlerFunc {
+	loginHTML := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        form { display: flex; flex-direction: column; width: 300px; }
+        input { margin-bottom: 10px; padding: 8px; }
+        button { padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Login</h1>
+    <form id="loginForm">
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Login</button>
+    </form>
+    <p>Don't have an account? <a href="/register">Register</a></p>
+    <div id="message"></div>
+    
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const response = await fetch('/api/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    username: formData.get('username'),
+                    password: formData.get('password'),
+                }),
+            });
+            
+            const result = await response.json();
+            const messageEl = document.getElementById('message');
+            
+            if (response.ok) {
+                messageEl.textContent = 'Login successful! Redirecting...';
+                setTimeout(() => {
+                    window.location.href = '/dashboard';
+                }, 1000);
+            } else {
+                messageEl.textContent = result.error || 'Login failed';
+            }
+        });
+    </script>
+</body>
+</html>`
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, loginHTML)
+	}
+}
+
+func (s *Server) handleRegisterPage() http.HandlerFunc {
+	registerHTML := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        form { display: flex; flex-direction: column; width: 300px; }
+        input { margin-bottom: 10px; padding: 8px; }
+        button { padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Register</h1>
+    <form id="registerForm">
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Register</button>
+    </form>
+    <p>Already have an account? <a href="/login">Login</a></p>
+    <div id="message"></div>
+    
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const response = await fetch('/api/register', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    username: formData.get('username'),
+                    password: formData.get('password'),
+                }),
+            });
+            
+            const result = await response.json();
+            const messageEl = document.getElementById('message');
+            
+            if (response.ok) {
+                messageEl.textContent = 'Registration successful! Redirecting to login...';
+                setTimeout(() => {
+                    window.location.href = '/login';
+                }, 1000);
+            } else {
+                messageEl.textContent = result.error || 'Registration failed';
+            }
+        });
+    </script>
+</body>
+</html>`
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, registerHTML)
+	}
+}
+
+func (s *Server) handleDashboard() http.HandlerFunc {
+	dashboardHTML := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        button { padding: 10px; background: #f44336; color: white; border: none; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Dashboard</h1>
+    <p>Welcome, {{.Username}}! This is a protected page.</p>
+    <button id="logoutBtn">Logout</button>
+    
+    <script>
+        document.getElementById('logoutBtn').addEventListener('click', async () => {
+            await fetch('/api/logout', { method: 'POST' });
+            window.location.href = '/';
+        });
+    </script>
+</body>
+</html>`
+
+	tmpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, err := s.getUserFromSession(r)
+		if err != nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		
+		w.Header().Set("Content-Type", "text/html")
+		tmpl.Execute(w, user)
+	}
+}
+
+// API handlers
+func (s *Server) handleRegister() http.HandlerFunc {
+	type request struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	
+	type response struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			sendJSON(w, response{Success: false, Error: "Invalid request format"}, http.StatusBadRequest)
+			return
+		}
+		
+		// Validate input
+		if req.Username == "" || req.Password == "" {
+			sendJSON(w, response{Success: false, Error: "Username and password are required"}, http.StatusBadRequest)
+			return
+		}
+		
+		// Hash password
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+		if err != nil {
+			sendJSON(w, response{Success: false, Error: "Internal server error"}, http.StatusInternalServerError)
+			return
+		}
+		
+		// Save user to database
+		_, err = s.db.Exec("INSERT INTO users (username, password) VALUES (?, ?)",
+			req.Username, string(hashedPassword))
+		
+		if err != nil {
+			log.Printf("Failed to register user: %v", err)
+			sendJSON(w, response{Success: false, Error: "Username already exists"}, http.StatusConflict)
+			return
+		}
+		
+		sendJSON(w, response{Success: true}, http.StatusCreated)
+	}
+}
+
+func (s *Server) handleLogin() http.HandlerFunc {
+	type request struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	
+	type response struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			sendJSON(w, response{Success: false, Error: "Invalid request format"}, http.StatusBadRequest)
+			return
+		}
+		
+		// Find user
+		var user User
+		var hashedPassword string
+		err := s.db.QueryRow("SELECT id, username, password FROM users WHERE username = ?", req.Username).
+			Scan(&user.ID, &user.Username, &hashedPassword)
+		
+		if err != nil {
+			sendJSON(w, response{Success: false, Error: "Invalid username or password"}, http.StatusUnauthorized)
+			return
+		}
+		
+		// Verify password
+		if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password)); err != nil {
+			sendJSON(w, response{Success: false, Error: "Invalid username or password"}, http.StatusUnauthorized)
+			return
+		}
+		
+		// Create session
+		token := uuid.New().String()
+		expiresAt := time.Now().Add(24 * time.Hour) // 24-hour session
+		
+		session := Session{
+			Token:     token,
+			UserID:    user.ID,
+			CreatedAt: time.Now(),
+			ExpiresAt: expiresAt,
+		}
+		
+		// Store session in database
+		_, err = s.db.Exec(
+			"INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+			session.Token, session.UserID, session.CreatedAt.Format(time.RFC3339), session.ExpiresAt.Format(time.RFC3339),
+		)
+		
+		if err != nil {
+			log.Printf("Failed to create session: %v", err)
+			sendJSON(w, response{Success: false, Error: "Failed to create session"}, http.StatusInternalServerError)
+			return
+		}
+		
+		// Store session in memory
+		s.sessions[token] = session
+		
+		// Set cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "session",
+			Value:    token,
+			Expires:  expiresAt,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		
+		sendJSON(w, response{Success: true}, http.StatusOK)
+	}
+}
+
+func (s *Server) handleLogout() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get session token from cookie
+		cookie, err := r.Cookie("session")
+		if err == nil {
+			// Delete session from memory
+			delete(s.sessions, cookie.Value)
+			
+			// Delete session from database
+			s.db.Exec("DELETE FROM sessions WHERE token = ?", cookie.Value)
+		}
+		
+		// Clear cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "session",
+			Value:    "",
+			MaxAge:   -1,
+			Path:     "/",
+			HttpOnly: true,
+		})
+		
+		sendJSON(w, map[string]bool{"success": true}, http.StatusOK)
+	}
+}
+
+// Helper function to send JSON responses
+func sendJSON(w http.ResponseWriter, data interface{}, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(data)
+}
+
+func main() {
+	// Create and initialize server
+	server, err := NewServer()
+	if err != nil {
+		log.Fatalf("Failed to initialize server: %v", err)
+	}
+	defer server.Close()
+	
+	// Start the server
+	if err := server.Start(); err != nil {
+		log.Fatalf("Server error: %v", err)
+	}
 }
